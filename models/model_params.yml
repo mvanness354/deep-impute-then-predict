@@ -1,0 +1,23 @@
+supmiwae:
+    n_layers: 4
+    n_samples: 50
+supnotmiwae:
+    n_layers: 4
+    n_samples: 50
+mlp:
+    add_mask: false
+    n_layers: 4
+mlp_mim:
+    add_mask: true
+    n_layers: 4
+neumiss:
+    neumiss_depth: 10
+    impute: true
+neumiss_mim:
+    neumiss_depth: 10
+    impute: true
+    add_mask: true
+ae:
+    add_mask: false
+    n_layers: 4
+gbt: {}
