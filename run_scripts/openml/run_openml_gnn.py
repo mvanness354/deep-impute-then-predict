@@ -17,7 +17,7 @@ import sys
 sys.path.append("../../")
 from tab_utils import load_openml_dataset, simple_mask, MNAR_mask, get_dataset_details
 
-sys.path.append("../../../GRAPE")
+sys.path.append("../../GRAPE")
 from training.gnn_y import train_gnn_y
 from uci.uci_subparser import add_uci_subparser
 from uci.uci_data import get_data

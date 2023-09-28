@@ -20,7 +20,7 @@ from sklearn.ensemble import RandomForestRegressor
 
 import sys
 sys.path.append("../../models") 
-from tf_models import MLPClassifier, NeuMissMLP, MLPMIWAE, MLPNotMIWAE, MLPRegressor
+from tf_models import MLPClassifier, NeuMissMLP, MLPMIWAE, MLPNotMIWAE, MLPRegressor, AutoEncodePredictor
 sys.path.append("../../")
 from tab_utils import load_openml_dataset, simple_mask, MNAR_mask, make_regression, make_neumiss_regression
 from tf_utils import get_tf_dataset
@@ -31,6 +31,97 @@ parser.add_argument("--n_trials", type=int, default=5)
 parser.add_argument("--n", type=int, default=10000)
 parser.add_argument("--p", type=float, default=20)
 args = parser.parse_args()
+
+model_map = {
+    "mlp": MLPRegressor,
+    "mlp_mim": MLPRegressor,
+    "neumiss": NeuMissMLP,
+    "neumiss_mim": NeuMissMLP,
+    "supmiwae": MLPMIWAE,
+    "supnotmiwae": MLPNotMIWAE,
+    "ae": AutoEncodePredictor,
+    # "gbt": HistGradientBoostingClassifier,
+}
+
+
+def run_tf(model_name, seed, train_X, train_y, val_X, val_y, test_X, test_y, test_X_complete, test_mask):
+
+    # Read in defeault task params
+    with open("../../models/model_params.yml", 'r') as f:
+        model_params = yaml.safe_load(f)[model_name]
+
+
+    if model_name == "gbt":
+        np.random.seed(seed)
+        model_params["random_state"] = seed
+        
+        model = model_map[model_name](**model_params)
+        model.fit(train_X, train_y)
+        score = roc_auc_score(test_y, model.predict_proba(test_X)[:, 1])
+        
+        return [seed, model_name, score, None]
+        
+    else:
+        tf.random.set_seed(seed)
+        np.random.seed(seed)
+        
+        batch_size = 128
+        train_dataset = get_tf_dataset([train_X, train_y], batch_size)
+        val_dataset = get_tf_dataset([val_X, val_y], batch_size, shuffle=False)
+        test_dataset = get_tf_dataset([test_X, test_y], batch_size, shuffle=False)
+
+        if model_name not in ["mlp", "mlp_mim"]:
+            model_params["n_input"] = train_X.shape[1]
+            model_params["regression"] = True
+
+        model = model_map[model_name](**model_params)
+
+        if model_name in ["supmiwae", "supnotmiwae"]:
+            model.compile(
+                optimizer = "adam",
+                metrics = [tf.keras.metrics.RootMeanSquaredError(name="rmse")],
+            )
+        else:
+
+            model.compile(
+                optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4),
+                loss = tf.keras.losses.MeanSquaredError(),
+                metrics = [tf.keras.metrics.RootMeanSquaredError(name="rmse")],
+            )
+
+        checkpoint_path = "checkpoints/"
+        callbacks = [
+            tf.keras.callbacks.EarlyStopping(monitor='val_rmse', mode="min", min_delta=1e-4, patience=5),
+            tf.keras.callbacks.ModelCheckpoint(
+                filepath=checkpoint_path,
+                save_weights_only=True,
+                monitor='val_rmse',
+                mode='min',
+                save_best_only=True,
+            )
+        ]
+        model.fit(
+            train_dataset,
+            epochs=100,
+            validation_data = val_dataset,
+            callbacks = callbacks,
+        )
+        
+        model.load_weights(checkpoint_path)
+
+        outputs = model.evaluate(test_dataset)
+        score = dict(zip(model.metrics_names, outputs))["rmse"]
+
+
+
+        # Get imputation scores
+        test_X_imputed = tf.concat([
+            model.impute(batch_X) for batch_X, _ in test_dataset
+        ], axis=0).numpy()
+        test_mask = np.isnan(test_X)
+        imputation_rmse = mean_squared_error(test_X_complete[test_mask], test_X_imputed[test_mask], squared=False)
+        
+        return [seed, score, imputation_rmse]
 
 def get_score_from_noise(latent_dim, seed):
 
@@ -48,7 +139,7 @@ def get_score_from_noise(latent_dim, seed):
     X, y = make_neumiss_regression(n_samples=n, n_features=p, prop_latent=latent_dim, seed=seed)
 
     # Generate MCAR mask
-    mask = simple_mask(X, seed=seed, return_na=True, p=0.3)
+    mask = simple_mask(X, seed=seed, return_na=True, p=0.5)
     X_masked = X * mask
 
     # Train/Val/Test split of 60/20/20
@@ -79,115 +170,30 @@ def get_score_from_noise(latent_dim, seed):
     train_mask = np.isnan(train_X)
     test_mask = np.isnan(test_X)
 
+    models = ["mlp", "neumiss", "supmiwae"]
+
     # First train model without imputation
     tf.random.set_seed(seed)
     np.random.seed(seed)
 
-    batch_size = 128
-    train_dataset = get_tf_dataset([train_X, train_y], batch_size)
-    val_dataset = get_tf_dataset([val_X, val_y], batch_size, shuffle=False)
-    test_dataset = get_tf_dataset([test_X, test_y], batch_size, shuffle=False)
+    results = []
+    for model in models:
+        print()
+        print(f"Running {model} with seed {seed} and latent_dim {latent_dim}")
+        print()
+        results.append([latent_dim, model] + run_tf(
+            model, seed, train_X, train_y, val_X, val_y, test_X, test_y, test_X_complete, test_mask
+        ))
 
-    model = MLPRegressor(n_layers=4)
-
-    model.compile(
-        optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4),
-        loss = tf.keras.losses.MeanSquaredError(),
-        metrics = [tf.keras.metrics.RootMeanSquaredError(name="rmse")],
-    )
-
-    checkpoint_path = "checkpoints/"
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(monitor='val_rmse', mode="min", min_delta=1e-4, patience=5),
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=checkpoint_path,
-            save_weights_only=True,
-            monitor='val_rmse',
-            mode='min',
-            save_best_only=True,
-        )
-    ]
-    model.fit(
-        train_dataset,
-        epochs=100,
-        validation_data = val_dataset,
-        callbacks = callbacks,
-    )
-
-    model.load_weights(checkpoint_path)
-    outputs = model.evaluate(test_dataset)
-    test_rmse_no_imputation = dict(zip(model.metrics_names, outputs))["rmse"]
-
-    # Get imputation rmse with 0 imputation
-    imputation_rmse_no_imputation = mean_squared_error(np.zeros_like(test_X_complete[test_mask]), test_X_complete[test_mask], squared=False)
-
-    train_input = train_X.copy()
-
-    # imputation via missforest
-    imputer = IterativeImputer(
-        estimator=HistGradientBoostingRegressor(),
-    )
-    train_input = imputer.fit_transform(train_input)  
-
-    val_input = val_X.copy()
-    val_input = imputer.transform(val_input) 
-
-    test_input = test_X.copy()
-    test_input = imputer.transform(test_input)
-
-    # Get imputation rmse
-    imputation_rmse_mf = mean_squared_error(test_input[test_mask], test_X_complete[test_mask], squared=False)
-
-    # Train MLP model
-    tf.random.set_seed(seed)
-    np.random.seed(seed)
-
-    batch_size = 128
-    train_dataset = get_tf_dataset([train_input, train_y], batch_size)
-    val_dataset = get_tf_dataset([val_input, val_y], batch_size, shuffle=False)
-    test_dataset = get_tf_dataset([test_input, test_y], batch_size, shuffle=False)
-
-    model = MLPRegressor(n_layers=4)
-
-    model.compile(
-        optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4),
-        loss = tf.keras.losses.MeanSquaredError(),
-        metrics = [tf.keras.metrics.RootMeanSquaredError(name="rmse")],
-    )
-
-    checkpoint_path = "checkpoints/"
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(monitor='val_rmse', mode="min", min_delta=1e-4, patience=5),
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=checkpoint_path,
-            save_weights_only=True,
-            monitor='val_rmse',
-            mode='min',
-            save_best_only=True,
-        )
-    ]
-    model.fit(
-        train_dataset,
-        epochs=100,
-        validation_data = val_dataset,
-        callbacks = callbacks,
-    )
-
-    model.load_weights(checkpoint_path)
-    outputs = model.evaluate(test_dataset)
-    test_rmse_imputation = dict(zip(model.metrics_names, outputs))["rmse"]
-
-
-    return test_rmse_no_imputation, test_rmse_imputation, imputation_rmse_no_imputation, imputation_rmse_mf
+    return results
 
 from itertools import product
 n_trials = args.n_trials
 seeds = np.arange(10, 10 + n_trials)
-results = [
-    [sigma] + list(get_score_from_noise(sigma, seed)) 
-    for sigma, seed in product(np.arange(0.05, 0.95, 0.05), seeds)
-]
+results = []
+for sigma, seed in product(np.arange(0.05, 1, 0.05), seeds):
+    results += get_score_from_noise(sigma, seed)
 
-results_df = pd.DataFrame(results, columns=["sigma", "rmse_zero_impute", "rmse_mf_impute", "imputation_rmse_zero_impute", "imputation_rmse_mf_impute"])
+results_df = pd.DataFrame(results, columns=["latent_dim", "model", "seed", "score", "impute_score"])
 print(results_df)
-results_df.to_csv(f"../results/synthetic_score_by_latent_dim.csv", index=False)
+results_df.to_csv(f"../../results/synthetic_score_by_latent_dim.csv", index=False)
